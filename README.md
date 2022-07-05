@@ -1,3 +1,4 @@
+## Calling Cloud Composer to Cloud Functions and back again, securely
 
 Sample [Cloud Composer 2](https://cloud.google.com/composer/docs/) (Apache Airflow) configuration to securely invoke [Cloud Functions](https://cloud.google.com/functions/docs/) or [Cloud Run](https://cloud.google.com/run/docs/).
 
