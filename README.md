@@ -1,5 +1,5 @@
 
-Sample [Cloud Composer](https://cloud.google.com/composer/docs/) (Apache Airflow) configuration to securely invoke [Cloud Functions](https://cloud.google.com/functions/docs/) or [Cloud Run](https://cloud.google.com/run/docs/).
+Sample [Cloud Composer 2](https://cloud.google.com/composer/docs/) (Apache Airflow) configuration to securely invoke [Cloud Functions](https://cloud.google.com/functions/docs/) or [Cloud Run](https://cloud.google.com/run/docs/).
 
 In addition this sample shows inverse:  how Cloud Functions can invoke a Composer DAG securely.  While `GCF->Composer` is documented [here](https://cloud.google.com/composer/docs/how-to/using/triggering-with-gcf), the configuration detailed here is minimal and (to me), easier to read.
    
@@ -9,184 +9,181 @@ In addition this sample shows inverse:  how Cloud Functions can invoke a Compose
 
 Anyway, the following will setup cloud composer, then we will trigger composer to invoke a cloud function...the cloud function will just trigger a different cloud composer endpoint....you can make it cycle back and eat its tail...
 
-### 1. Create Composer Environment
+---
 
+Please see [Google ID Tokens](https://github.com/salrashid123/google_id_token)
+
+This repo was updated for composer2.  If you want composer1, see the previous commits in this repo.
+
+---
+### 1. Create Composer 2 Environment
 
 ```bash
-export GOOGLE_PROJECT_ID=`gcloud config get-value core/project`
-export PROJECT_NUMBER=`gcloud projects describe $GOOGLE_PROJECT_ID --format='value(projectNumber)'`
+export PROJECT_ID=`gcloud config get-value core/project`
+export PROJECT_NUMBER=`gcloud projects describe $PROJECT_ID --format='value(projectNumber)'`
+export GCLOUD_USER=`gcloud config get-value core/account`
 
-gcloud composer environments create composer1  --location us-central1 
+gcloud projects add-iam-policy-binding $PROJECT_ID \
+    --member serviceAccount:service-$PROJECT_NUMBER@cloudcomposer-accounts.iam.gserviceaccount.com \
+    --role roles/composer.ServiceAgentV2Ext
 
-gcloud composer environments  list --locations us-central1
+gcloud composer environments create composer2 \
+    --location us-central1 \
+    --image-version composer-2.0.18-airflow-2.2.5
 ```
 
+### 2. Add Python Packages to Composer
 
-### 2. Add Python Packages and GCF Connection URL
-
-The following steps sets up Airflow connections we will use internally.  The commands below describes a URL to a GCF function we will enable later.
+The following steps sets up Airflow connections we will use internally. 
 
 - Configure `requirements.txt`
+
 ```
-gcloud composer environments update composer1  \
+cd composer_to_gcf/
+gcloud composer environments update composer2  \
   --update-pypi-packages-from-file requirements.txt --location us-central1
 ```
 
-- Configure connection
-```
-gcloud composer environments update composer1  \
-  --update-env-variables=AIRFLOW_CONN_MY_GCF_CONN=https://us-central1-$GOOGLE_PROJECT_ID.cloudfunctions.net --location us-central1
-```
+The following will list the default GCS bucket composer uses, its API URL and the serviceAccount it uses
 
-> Note: each of these commands takes ~10mins; go grab a coffee.
+```bash
+gcloud composer environments describe composer2 --location us-central1 --format="get(config.dagGcsPrefix)"
 
+export COMPOSER_SA=`gcloud composer environments describe composer2 --location us-central1  --format="value(config.nodeConfig.serviceAccount)"`
+echo $COMPOSER_SA
 
-- Verify configurations via cli and on the Cloud Console for Composer
-
-```
-gcloud composer environments describe composer1 --location us-central1
-```
-
-The following will list the default GCS bucket used for its configurations and DAG storage
-```
-gcloud composer environments describe composer1 --location us-central1 --format="get(config.dagGcsPrefix)"
+export TOKEN=`gcloud auth print-access-token`
+export AIRFLOW_URI=`curl -s  -H "Authorization: Bearer $TOKEN"  \
+   https://composer.googleapis.com/v1/projects/$PROJECT_ID/locations/us-central1/environments/composer2 | jq -r '.config.airflowUri'`
+echo $AIRFLOW_URI
+# in my case it was:
+# https://8196681741b34059af0ab421d6ebfd95-dot-us-central1.composer.googleusercontent.com
 ```
 
-- You can now open up the [Airflow GUI](https://cloud.google.com/composer/docs/how-to/accessing/airflow-web-interface)
+You can now open up the [Airflow GUI](https://cloud.google.com/composer/docs/how-to/accessing/airflow-web-interface)
 
 and also see the GCP Console:
 
 - Config:
 ![images/composer_config.png](images/composer_config.png)
 
-- Env
-![images/composer_env.png](images/composer_env.png)
-
 - Python Packages
 ![images/composer_python_packages.png](images/composer_python_packages.png)
 
+### 3. Deploy GCF gen2
 
-### 3.  Identify the client_id used by IAP 
-
-Cloud Composer is shielded by Cloud Identity Aware proxy.  The following command will identify the oauth2 `client_id` it uses which we will later need to trigger DAGs externally from GCF.  For refrerence, see [triggering with gcf](https://cloud.google.com/composer/docs/how-to/using/triggering-with-gcf)
-
-
-- Get ariflow URL:
- 
-If you are an Editor on the project running Airflow, you should have `Editor` rights to invoke the endpoint:
-
-(the follwing command uses `jq` cli to parse JSON)
+First create a new service account
 
 ```bash
-$ curl -s  -H "Authorization: Bearer `gcloud auth print-access-token`" https://composer.googleapis.com/v1beta1/projects/$GOOGLE_PROJECT_ID/locations/us-central1/environments/composer1 | jq [.config.airflowUri]
+gcloud iam service-accounts create gcf-composer
 ```
 
-In my case, the URL for Airflow is:
-```json
-[
-  "https://r1d366b885bb81b73-tp.appspot.com"
-]
-```
-
-- Use the URL to extract the client ID
-
-Attempt to make an unauthenticated call to the URL.  You should see an error but within the curl output you will find the elusive `client_id`:
+And deploy the GCF function using that SA
 
 ```bash
-curl -v https://r1d366b885bb81b73-tp.appspot.com
+cd echo_app_python/
+gcloud beta functions deploy  echoapp \
+ --gen2 --runtime python38 --trigger-http --region=us-central1 \
+ --no-allow-unauthenticated \
+ --set-env-vars=AIRFLOW_URI=$AIRFLOW_URI \
+ --service-account gcf-composer@$PROJECT_ID.iam.gserviceaccount.com
+
+# Get the URL where gen2 is deployed
+CR_URL=`gcloud run services describe echoapp --format="value(status.address.url)"`
+echo $CR_URL
 ```
 
-eg, in my case the command above showed
-```
-location: https://accounts.google.com/o/oauth2/v2/auth?client_id=491562778408-sj8hb4035bp7ui918ra0i9qbhbqnejk1.apps.googleusercontent.com&response_type=code&scope=openid+email&redirect_uri=https://r1d366b885bb81b73-tp.appspot.com/_gcp_gatekeeper/authenticate&cred_ref=true&state=CilodHRwczovL3IxZDM2NmI4ODViYjgxYjczLXRwLmFwcHNwb3QuY29tLxIwQU91REJvbndMSlJlOEJ3aTBkaDBZeXdlbktYSTBxNVpxdzoxNTU4NTE0MzgyMzc4
-```
-
-which means the `client_id` is `491562778408-sj8hb4035bp7ui918ra0i9qbhbqnejk1.apps.googleusercontent.com`
-
-
-Note the client_id and composer_url:
+### 4. Allow Composer to invoke GCF
 
 ```bash
-target_audience = `491562778408-sj8hb4035bp7ui918ra0i9qbhbqnejk1.apps.googleusercontent.com`
-url = `https://r1d366b885bb81b73-tp.appspot.com`
+gcloud run services add-iam-policy-binding echoapp \
+   --member="serviceAccount:$COMPOSER_SA"   --role="roles/run.invoker"
 ```
+
+### 5. Allow GCF to invoke Composer
+
+Authorize GCF by identifying the client id GCF will use to call Composer.  See [Access Airflow REST API using a service account](https://cloud.google.com/composer/docs/composer-2/access-airflow-api#gcloud).
+
+
+```bash
+export NUMERIC_USER_ID=`gcloud iam service-accounts describe \
+  gcf-composer@$PROJECT_ID.iam.gserviceaccount.com \
+  --format="value(oauth2ClientId)"`
+echo $NUMERIC_USER_ID
+
+gcloud auth application-default login
+
+gcloud composer environments run composer2 \
+    --location us-central1 \
+    users create -- \
+    -u accounts.google.com:NUMERIC_USER_ID \
+    -e NUMERIC_USER_ID  \
+    -f NUMERIC_USER_ID \
+    -l - -r Op --use-random-password
+
+# now allow gcf to invoke composer via IAM
+ gcloud projects add-iam-policy-binding $PROJECT_ID  \
+     --member serviceAccount:gcf-composer@$PROJECT_ID.iam.gserviceaccount.com \
+     --role roles/composer.user
+```
+
+
+### 6. Update Composer Connection settings
+
+Setup a conn object in composer that will call our endpoint
+
+```bash
+CR_URL=`gcloud run services describe echoapp --format="value(status.address.url)"`
+echo $CR_URL
+# in my case its https://echoapp-6w42z6vi3q-uc.a.run.app
+
+gcloud composer environments update composer2  \
+  --update-env-variables=AIRFLOW_CONN_MY_GCF_CONN=$CR_URL --location us-central1
+
+gcloud composer environments run composer2  \
+  --location us-central1 connections -- add  my_gcf_conn --conn-type=http \
+  --conn-host="$CR_URL" --conn-port 443
+```
+
+![images/composer_env.png](images/composer_env.png)
+
 
 ### 4. Deploy DAGs
 
 - Deploy the DAG that _sends_ authenticated calls to GCF:
 
-Edit `to_gcf.py` and replace the following line with your projectID 
+Edit `to_gcf.py` and set the `target_audience` to the value of your CR endpoint `CR_URL`
+
 ```
-target_audience = 'https://us-central1-$GOOGLE_PROJECT_ID.cloudfunctions.net/echo_app_python'
+target_audience = 'https://echoapp-6w42z6vi3q-uc.a.run.app'
 ```
 then
-```
-gcloud composer environments storage dags import --environment composer1  --location us-central1   --source to_gcf.py
+
+```bash
+gcloud composer environments storage dags import --environment composer2 \
+   --location us-central1   --source to_gcf.py
 ```
 
 - Deploy the DAG that _receives_ authenticated calls from GCF:
 
-```
-gcloud composer environments storage dags import --environment composer1  --location us-central1   --source from_gcf.py
+```bash
+gcloud composer environments storage dags import --environment composer2 \
+   --location us-central1   --source from_gcf.py
 ```
 
 ![images/dags.png](images/dags.png)
 
-### 5. Deploy GCF
 
-Edit `main.py` and update  `target_url` and `url` with the values from **step 3**:
-
-in my case:
-
-```python
-    target_audience = '491562778408-sj8hb4035bp7ui918ra0i9qbhbqnejk1.apps.googleusercontent.com'
-    url = 'https://r1d366b885bb81b73-tp.appspot.com'
-```
-
-then deploy
-
-```
-gcloud functions deploy  echo_app_python --region=us-central1
-```
-
-### 6. Set IAM Permissions
-
-Now set IAM permissions to
-
-### Allow Composer to call GCF
-
-When we setup composer, we did not specify the serivce account it should run as.  By default, it will use the compute engine service account which is in the form:
-
-```
-$PROJECT_NUMBER-@developer.gserviceaccount.com
-```
-
-the apply:
-
-```
-gcloud alpha functions add-iam-policy-binding echo_app_python  \
-    --member serviceAccount:$PROJECT_NUMBER-compute@developer.gserviceaccount.com   --role roles/cloudfunctions.invoker
-```
-
-### Allow GCF to call Composer
-
-During our setup of Cloud Functions, we did not specify a service account.  By default GCF will use an account in the form:
-
-```
-$GOOGLE_PROJECT_ID@appspot.gserviceaccount.com
-```
-
-so using that, go to the Cloud Consoles IAM page and for that account, add the `Composer User` IAM role
-
-![images/gcf_to_composer_iam.png](images/gcf_to_composer_iam.png)
-
-GCF invokes a DAG directly using the  [Experimental Rest Endpoint](https://airflow.apache.org/api.html#experimental-rest-api)
-
-### 7. Invoke DAG directly
+### 5. Invoke DAG directly
 
 The default DAG `callgcf` DAG is set to run every 30minutes.  However, you can invoke it directly if you want via the UI or CLI:
 
 - [CLI](https://cloud.google.com/composer/docs/how-to/accessing/airflow-cli#running_airflow_cli_commands)
+
+
+```
+gcloud composer environments run composer2    --location us-central1 dags -- trigger callgcf
+```
 
 On the console, you should see invocation back and forth:
 
@@ -195,6 +192,128 @@ On the console, you should see invocation back and forth:
 
 - `fromgcf`:
 ![images/from_gcf.png](images/from_gcf.png)
+
+If you want to trigger using curl,
+
+```bash
+curl -H "Authorization: Bearer `gcloud auth print-access-token`" \
+  -d '{"conf": {"key":"value"}}' -H "content-type: application/json" \
+  $AIRFLOW_URI/api/v1/dags/fromgcf/dagRuns
+
+```
+
+
+### gRPC Support
+
+If instead of HTTP, you want to invoke a Cloud Run gRPC service, thats much more complicated and not (as of 6/3/22), not possible with the [gRPC Airflow Operator](https://airflow.apache.org/docs/apache-airflow-providers-grpc/stable/connections/grpc.html)
+
+This is because the [gRPC Operator](https://airflow.apache.org/docs/apache-airflow-providers-grpc/stable/_api/airflow/providers/grpc/operators/grpc/index.html) does not support the [Google ID Tokens](https://github.com/salrashid123/google_id_token).  It support service Account self-signed JWT  but not oidc tokens
+
+
+One solution which requires a pull request upstream is to add a hook option [here](https://github.com/apache/airflow/blob/main/airflow/providers/grpc/hooks/grpc.py#L93) with something like the following.  The `audience` value needs to get provided as part of the conn object, i suspect 
+
+```python
+elif auth_type == "OIDC_GOOGLE":
+
+    # target_audience = self._get_field("audience")
+    target_audience = "https://grpc-server-6w42z6vi3q-uc.a.run.app"
+    request = google.auth.transport.requests.Request()
+
+    ## use ADC pref
+    token = id_token.fetch_id_token(request, target_audience)
+    id_creds = google.oauth2.credentials.Credentials(token=token)
+
+    ## alternative if on GCE
+    #id_creds = compute_engine.IDTokenCredentials(request=request, target_audience=target_audience, use_metadata_identity_endpoint=True)
+    channel = google_auth_transport_grpc.secure_authorized_channel(id_creds, request, base_url)
+```
+
+i hardcoded the audience here to my cloud run instance but used the rest of the config as shown like this 
+
+![images/grpc_conn.png](images/grpc_conn.png)
+
+once thats' done, the dag is something like this where in the following the proto is from [here](https://github.com/salrashid123/terraform-provider-grpc-full/tree/main/example)
+
+```python
+    from echo_pb2 import EchoRequest, Middle
+    from echo_pb2_grpc import EchoServerStub
+    from airflow.providers.grpc.operators.grpc import GrpcOperator
+
+    with models.DAG(
+            'to_cr',
+            schedule_interval=datetime.timedelta(minutes=5),
+            default_args=default_dag_args) as dag:
+
+        call_grpc_1 = GrpcOperator(task_id='task_id',
+                                 stub_class=EchoServerStub,
+                                 call_func='SayHello',
+                                 grpc_conn_id='cr_grpc_conn',
+                                 data={'request': EchoRequest(first_name='sal', last_name='mander', middle_name=Middle(name='a'))},
+                                 log_response=True,
+```
+
+Alternatively, the operator mentions setting a `custom_connection_func`.  Note, the connection `cr_grpc_conn_default` uses the CUSTOM auth type
+
+
+```python
+
+import google.auth
+from google.auth.transport.requests import AuthorizedSession
+
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence
+
+from google.auth.transport import (
+    grpc as google_auth_transport_grpc,
+    requests as google_auth_transport_requests,
+)
+
+from echo_pb2 import EchoRequest, Middle
+from echo_pb2_grpc import EchoServerStub
+
+from airflow.providers.grpc.operators.grpc import GrpcOperator
+
+default_dag_args = {
+    'depends_on_past': False,
+    'start_date': airflow.utils.dates.days_ago(2),
+    'retries': 1,
+    'retry_delay': datetime.timedelta(minutes=5),
+}
+
+class gconn:
+    def getconn(self):
+        target_audience = "https://grpc-server-6w42z6vi3q-uc.a.run.app"
+        request = google.auth.transport.requests.Request()
+        token = id_token.fetch_id_token(request, target_audience)
+        id_creds = google.oauth2.credentials.Credentials(token=token)
+
+        con = GrpcHook(grpc_conn_id='cr_grpc_conn_default')
+
+        u = con.conn.host + ":" + str(con.conn.port)
+        channel = google_auth_transport_grpc.secure_authorized_channel(id_creds, request, u)
+
+        return channel
+
+def callback(response: Any, context: "Context"):
+    print(repr(response))
+    return response
+
+with models.DAG(
+        'to_cr',
+        schedule_interval=datetime.timedelta(minutes=5),
+        default_args=default_dag_args) as dag:
+
+    # https://airflow.apache.org/docs/apache-airflow-providers-grpc/stable/_api/airflow/providers/grpc/operators/grpc/index.html
+    call_grpc_1 = GrpcOperator(task_id='task_id',
+                             stub_class=EchoServerStub,
+                             call_func='SayHello',
+                             grpc_conn_id='cr_grpc_conn_default',
+                             data={'request': EchoRequest(first_name='sal', last_name='mander', middle_name=Middle(name='a'))},
+                             log_response=True,
+                             custom_connection_func = gconn.getconn,
+                             response_callback= callback
+        )
+    call_grpc_1
+```
 
 ## References
 - [Automatic oauth2: Using Cloud Scheduler and Tasks to call Google APIs](https://medium.com/google-cloud/automatic-oauth2-using-cloud-scheduler-and-tasks-to-call-google-apis-55f0a8905baf)
@@ -205,61 +324,3 @@ On the console, you should see invocation back and forth:
 - [Airflow: Authenticating to GCP APIs](https://airflow.apache.org/howto/connection/gcp.html#authenticating-to-gcp)
    Note: the tokens provided by `google_cloud_default` are `access_tokens` intended to _invoke_ GCP API; they cannot be used to access Cloud Run or GCF endpoints
 - [Airflow: gcp_api_base_hook.py](https://github.com/apache/airflow/blob/master/airflow/contrib/hooks/gcp_api_base_hook.py)
-
-
-
----
-
-### Appendix
-
-The following snippets details how to invoke the DAG directly using a service_account json file. 
-
-Note:  you must first allow that service accout IAM permissions the  `Composer User` first
-
-
-- service_account_dag.py
-
-```python
-from google.oauth2 import id_token
-from google.oauth2 import service_account
-import google.auth
-import google.auth.transport.requests
-from google.auth.transport.requests import AuthorizedSession
-
-target_audience = '491562778408-sj8hb4035bp7ui918ra0i9qbhbqnejk1.apps.googleusercontent.com'
-
-url = 'https://r1d366b885bb81b73-tp.appspot.com/api/experimental/dags/callgcf/dag_runs'
-certs_url='https://www.googleapis.com/oauth2/v1/certs'
-
-additional_claims = { }
-
-creds = service_account.IDTokenCredentials.from_service_account_file(
-        '/path/to/svc.json',
-        target_audience= target_audience, additional_claims=additional_claims)
-
-authed_session = AuthorizedSession(creds)
-
-# make authenticated request
-headers = {
-   "conf": ""
-}
-r = authed_session.post(url, headers=headers)
-
-print r.status_code
-print r.text
-
-
-# verify
-request = google.auth.transport.requests.Request()
-idt = creds.token
-print idt
-print id_token.verify_token(idt,request,certs_url=certs_url)
-```
-
-- curl
-```
-$ curl -X POST -d '{"conf":""}' -H "content-type: application/json" -H "Authorization: Bearer $ID_TOKEN"  
-{
-  "message": "Created <DagRun callgcf @ 2019-05-22 09:11:46: manual__2019-05-22T09:11:46, externally triggered: True>"
-}
-```

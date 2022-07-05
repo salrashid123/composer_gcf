@@ -1,1 +1,4 @@
 requests
+google-auth
+Flask
+gunicorn

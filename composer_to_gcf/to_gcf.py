@@ -15,6 +15,9 @@ from airflow.operators import python_operator
 from airflow.exceptions import AirflowException
 from airflow.hooks.http_hook import HttpHook
 
+from google.oauth2 import id_token
+import google.auth.transport.requests
+
 import requests
 
 default_dag_args = {
@@ -30,11 +33,9 @@ class GcpOidcOperator(SimpleHttpOperator):
 
         self.log.info("Calling HTTP method")
 
-        target_audience = 'https://us-central1-$GOOGLE_PROJECT_ID.cloudfunctions.net/echo_app_python'
-        metadata_url = "http://metadata/computeMetadata/v1/instance/service-accounts/default/identity?audience=" + target_audience
-        r = requests.get(metadata_url, headers={"Metadata-Flavor":"Google"})
-        idt = r.text
-
+        target_audience = 'https://echoapp-6w42z6vi3q-uc.a.run.app'
+        request = google.auth.transport.requests.Request()
+        idt = id_token.fetch_id_token(request, target_audience)
         self.headers = { 'Authorization' : "Bearer " + idt }
         response = http.run(self.endpoint,
                             self.data,
@@ -43,8 +44,7 @@ class GcpOidcOperator(SimpleHttpOperator):
         if self.response_check:
             if not self.response_check(response):
                 raise AirflowException("Response check returned False.")
-        if self.xcom_push_flag:
-            return response.json()
+        return response.json()
 
 with models.DAG(
         'callgcf',
@@ -63,24 +63,22 @@ with models.DAG(
         task_id='get_op1',
         method='GET',
         http_conn_id='my_gcf_conn',
-        endpoint='/echo_app_python',
+        endpoint='/echo',
         headers={},
-        xcom_push=True,
         response_check=lambda response: False if len(response.json()) == 0 else True,
         dag=dag,
     )
 
-    call_gcf2 = GcpOidcOperator(
-        task_id='get_op2',
-        method='GET',
-        http_conn_id='my_gcf_conn',
-        endpoint='/echo_app_python',
-        headers={},
-        xcom_push=True,
-        response_check=lambda response: False if len(response.json()) == 0 else True,
-        dag=dag,
-    )
+    # call_gcf2 = GcpOidcOperator(
+    #     task_id='get_op2',
+    #     method='POST',
+    #     http_conn_id='my_gcf_conn',
+    #     data = {"aaa": "bbb"},
+    #     endpoint='/',
+    #     headers={},
+    #     response_check=lambda response: False if len(response.json()) == 0 else True,
+    #     dag=dag,
+    # )
 
-    hello_python >> call_gcf1 >> call_gcf2
-
+    hello_python >> call_gcf1
 
